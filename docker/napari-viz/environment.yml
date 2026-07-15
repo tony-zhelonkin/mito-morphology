@@ -1,0 +1,20 @@
+name: viz
+channels: [conda-forge]
+dependencies:
+  - python=3.12
+  - napari=0.5.*
+  - pyqt=5.*
+  - numpy>=2.2,<2.3
+  - scipy
+  - scikit-image>=0.26
+  - matplotlib
+  - tifffile
+  - pip
+  - pip:
+      - bioio
+      - bioio-czi
+      - "napari-mcp>=0.1,<0.2"
+      - "fastmcp>=2.10,<3"     # <3: 3.x drops _tool_manager and breaks the bridge
+      - "marimo>=0.9"
+      - anywidget
+      - "git+https://github.com/tony-zhelonkin/mito-morphology.git"
