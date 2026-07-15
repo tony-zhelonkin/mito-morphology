@@ -13,6 +13,14 @@ PORT = 9999
 
 def main() -> None:
     viewer = napari.Viewer(title=f"mito-viz — MCP bridge :{PORT}")
+    # On a headless Xvfb display the window comes up 1x1; maximize it so VNC/noVNC
+    # shows a usable GUI rather than a blank desktop.
+    try:
+        win = viewer.window._qt_window
+        win.resize(1600, 950)
+        win.showMaximized()
+    except Exception as exc:  # pragma: no cover - display quirks
+        print(f"[napari-mcp] could not maximize window: {exc}", flush=True)
     server = NapariBridgeServer(viewer, port=PORT)
     if server.start():
         print(f"[napari-mcp] bridge up -> http://localhost:{PORT}/mcp", flush=True)

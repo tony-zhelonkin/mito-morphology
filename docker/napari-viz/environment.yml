@@ -17,4 +17,5 @@ dependencies:
       - "fastmcp>=2.10,<3"     # <3: 3.x drops _tool_manager and breaks the bridge
       - "marimo>=0.9"
       - anywidget
+      - websockify        # serves noVNC (browser VNC) on :6080 -> x11vnc :5901
       - "git+https://github.com/tony-zhelonkin/mito-morphology.git"

@@ -6,7 +6,8 @@ or the analysis pixi env:
 - **Xvfb + software GL (mesa llvmpipe)** — a virtual display for napari
 - **napari + napari-mcp bridge** (`:9999`) — Claude Code and the notebook drive it
 - **marimo** (`:2720`) — reactive notebook / report (edit mode, write your own cells)
-- **x11vnc** (`:5901`, optional) — view the *real* napari GUI in a VNC client
+- **x11vnc** (`:5901`) + **noVNC** (`:6080`) — view the *real* napari GUI, in a VNC
+  client (`localhost:5901`) or a browser (`http://localhost:6080/vnc.html`)
 
 The container runs with `--network host`, so all three land on the host's **localhost**
 (reachable by Claude Code directly, and by you over an SSH tunnel). Nothing binds a public
@@ -26,9 +27,10 @@ The repo is mounted at `/repo`; the notebook is `<repo>/02_analysis/explore.py`.
 
 ## Connect from your laptop
 ```bash
-ssh -L 2720:localhost:2720 -L 5901:localhost:5901 you@remote
-# browser   -> http://localhost:2720      (marimo — reactive report)
-# VNC client-> localhost:5901             (live napari GUI)
+ssh -L 2720:localhost:2720 -L 6080:localhost:6080 -L 5901:localhost:5901 you@remote
+# browser   -> http://localhost:2720          (marimo — reactive report)
+# browser   -> http://localhost:6080/vnc.html (live napari GUI, noVNC)
+# VNC client-> localhost:5901                 (live napari GUI, native)
 ```
 
 ## Notes
