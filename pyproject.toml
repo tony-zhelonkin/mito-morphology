@@ -1,0 +1,27 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "mito-morphology"
+version = "0.1.0"
+description = "Shared compute for mitochondrial network morphology in ISD90-activated BMDCs"
+authors = [{ name = "Anton Zhelonkin" }]
+license = "MIT"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "numpy",
+    "scipy",
+    "scikit-image>=0.26",
+    "tifffile",
+    "bioio",
+    "bioio-czi",
+    "matplotlib",
+]
+
+[project.scripts]
+mito = "mitomorph.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/mitomorph"]
