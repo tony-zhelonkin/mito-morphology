@@ -17,6 +17,19 @@ from .io import area_px, radius_px, to_uint8
 # exactly, preserving the frozen MVP behaviour (min 32 px). Kept fixed by decision.
 _MIN_OBJECT_PX = 32
 
+# --- Cellpose whole-cell footprint (Module A) ---------------------------------
+# cellprob < 0 grows masks into dimmer edge mito (fixes under-coverage of big
+# cells); flow > default keeps lower-quality masks. MITO_GAMMA < 1 brightens dim
+# peripheral mito so Cellpose recalls faint edges / low-signal cells.
+CELLPROB_THRESHOLD = -2.0
+FLOW_THRESHOLD = 0.7
+MITO_GAMMA = 0.5
+
+# LAMBDA (in EDT-pixel units): cost of crossing one non-mito pixel relative to one
+# pixel of Euclidean distance. High enough that any mito path beats a dark-gap
+# crossing, so watershed ridges fall in the mito-empty gaps *between* cells.
+_ELEVATION_LAMBDA = 50.0
+
 
 def preprocess_li(mip: np.ndarray, px_um: float) -> np.ndarray:
     """Match the MVP Li baseline with a physical top-hat radius."""
@@ -88,7 +101,13 @@ def segment_nuclei(
 def build_territories(
     nucleus_labels: np.ndarray, cfg: ExperimentConfig, px_um: float
 ) -> np.ndarray:
-    """Build nucleus-derived, radius-capped nearest-nucleus territories."""
+    """LEGACY / DEPRECATED — radius-capped Euclidean Voronoi from nuclei.
+
+    Splits purely by nearest nucleus, so distal mito of elongated/stellate cells
+    bleed into a neighbouring nucleus and adjacent cells cannot be separated.
+    Superseded by ``build_territories_v2`` (footprint-bounded, marker-controlled
+    watershed). Kept only as a fallback when Cellpose is unavailable; do not
+    remove (backtracking / provenance)."""
     nucleus_mask = nucleus_labels > 0
     # isotropic_dilation is EDT-based (O(N), exact for a disk); a grey dilation with
     # this ~170 px radius footprint is O(N*K) and blows time/memory on full frames.
@@ -98,3 +117,90 @@ def build_territories(
     elevation = ndimage.distance_transform_edt(~nucleus_mask)
     territories = segmentation.watershed(elevation, markers=nucleus_labels, mask=foreground)
     return territories.astype(np.int32)
+
+
+def _enhance_mito(mito_mip: np.ndarray) -> np.ndarray:
+    """Gamma-brighten dim mito so Cellpose recalls faint peripheries / cells."""
+    x = to_uint8(mito_mip).astype(np.float32) / 255.0
+    return (np.power(x, MITO_GAMMA) * 255.0).astype(np.float32)
+
+
+def cell_footprint(
+    mito_mip: np.ndarray,
+    nucleus_mip: np.ndarray,
+    cfg: ExperimentConfig,
+    px_um: float,
+    gpu: bool = False,
+) -> np.ndarray:
+    """Semantic (binary) whole-cell footprint from the mito channel via Cellpose.
+
+    Runs ``cyto3`` on a 2-channel image [cytoplasm=enhanced mito, nucleus] and
+    returns the BINARY union of all detected cell bodies (not instance ids) —
+    instance resolution is done downstream by ``resolve_instances``. Cellpose is
+    imported lazily (the env may lack it at import time)."""
+    from cellpose import models
+
+    diameter = 2.0 * radius_px(cfg.max_cell_radius_um, px_um)  # cell ~ 2x radius cap
+    rgb = np.zeros((*mito_mip.shape, 3), dtype=np.float32)
+    rgb[..., 0] = _enhance_mito(mito_mip)
+    rgb[..., 1] = to_uint8(nucleus_mip)
+    model = models.Cellpose(gpu=gpu, model_type="cyto3")
+    masks, _, _, _ = model.eval(
+        rgb, diameter=diameter, channels=[1, 2],
+        cellprob_threshold=CELLPROB_THRESHOLD, flow_threshold=FLOW_THRESHOLD,
+    )
+    return masks > 0
+
+
+def resolve_instances(
+    nucleus_labels: np.ndarray,
+    footprint: np.ndarray,
+    mito_mask: np.ndarray,
+    cfg: ExperimentConfig,
+    px_um: float,
+) -> np.ndarray:
+    """Nucleus-seeded, footprint-bounded marker-controlled watershed.
+
+    Each nucleus is one marker, so adjacent cells cannot merge and a single
+    nucleus yields a single basin (no over-split). Basins are bounded by the
+    Cellpose ``footprint`` and flood over a geodesic elevation that is cheap to
+    cross through mito and expensive across dark gaps, so ridges fall between
+    cells. Every territory is labelled by its nucleus id.
+
+    A nucleus with no overlapping footprint (Cellpose missed the body) still gets
+    a radius-capped geodesic disk so nothing is dropped."""
+    nucleus_mask = nucleus_labels > 0
+    footprint = footprint.astype(bool)
+
+    elevation = ndimage.distance_transform_edt(~nucleus_mask).astype(np.float32)
+    elevation += _ELEVATION_LAMBDA * (~mito_mask & ~nucleus_mask).astype(np.float32)
+
+    # Include nucleus pixels so every marker sits inside the flood mask.
+    bounded = footprint | nucleus_mask
+    territories = segmentation.watershed(
+        elevation, markers=nucleus_labels, mask=bounded
+    ).astype(np.int32)
+
+    # Fallback for nuclei Cellpose missed: radius-capped disk over unclaimed pixels.
+    radius = radius_px(cfg.max_cell_radius_um, px_um)
+    for nid in range(1, int(nucleus_labels.max()) + 1):
+        nuc = nucleus_labels == nid
+        if not nuc.any() or footprint[nuc].any():
+            continue
+        claim = morphology.isotropic_dilation(nuc, radius) & (territories == 0)
+        territories[claim] = nid
+    return territories
+
+
+def build_territories_v2(
+    mito_mip: np.ndarray,
+    nucleus_mip: np.ndarray,
+    nucleus_labels: np.ndarray,
+    mito_mask: np.ndarray,
+    cfg: ExperimentConfig,
+    px_um: float,
+    gpu: bool = False,
+) -> np.ndarray:
+    """New Module-A entrypoint: Cellpose footprint -> marker-controlled watershed."""
+    footprint = cell_footprint(mito_mip, nucleus_mip, cfg, px_um, gpu=gpu)
+    return resolve_instances(nucleus_labels, footprint, mito_mask, cfg, px_um)

@@ -1,9 +1,13 @@
 """Cell-QC compute: nucleus-seeded territories + per-cell mitochondrial metrics.
 
 QC is objective, condition-blind, and flag-only (rows are never dropped):
-  - border_touch: territory bbox reaches the frame edge
+  - border_touch: the true cell BODY reaches the frame edge (not an inflated bbox)
   - out_of_focus: focus_score below a per-image relative threshold (DAPI-based)
   - empty:        mito area below mito_min_um2
+
+Territories come from the footprint-bounded, nucleus-seeded watershed
+(``build_territories_v2``); merges/over-splits are resolved upstream, so there is
+no "exactly one nucleus" post-hoc filtering here.
 
 Focus is flagged relative to each image's own median, never by a cross-experiment
 constant, because focus_score is not comparable across imaging batches.
@@ -17,14 +21,29 @@ from skimage import morphology, segmentation
 from .config import ExperimentConfig
 from .io import read_manifest, resolve_samples, to_uint8, write_csv
 from .metrics import compute_skeleton_metrics, focus_score, mito_shape_metrics
-from .segment import build_territories, pipeline_li, segment_nuclei
+from .segment import (
+    build_territories,
+    cell_footprint,
+    pipeline_li,
+    resolve_instances,
+    segment_nuclei,
+)
 
 CELL_FIELDS = [
-    "experiment", "group", "replicate", "sample", "px_um", "cell_id",
+    "experiment", "group", "replicate", "sample", "px_um", "cell_id", "nucleus_id",
     "nucleus_area_um2", "territory_area_um2", "mito_area_um2", "mito_area_fraction",
     "skeleton_length_um", "branch_count", "mito_solidity", "mito_form_factor",
-    "mito_border_frac", "focus_score", "edge_distance_px",
+    "mito_border_frac", "focus_score", "edge_distance_px", "footprint_confidence",
     "border_touch", "out_of_focus", "empty", "qc_pass",
+]
+
+# Module A -> B contract: one row per cell, keyed on the territory raster label.
+# nucleus_id == cell_id (each territory is labelled by its seeding nucleus).
+# footprint_confidence: fraction of the territory covered by the Cellpose footprint
+# (1.0 = fully body-backed, 0.0 = radius-disk fallback; NaN if Cellpose unavailable).
+QC_FIELDS = [
+    "experiment", "group", "replicate", "sample",
+    "cell_id", "nucleus_id", "area_um2", "border_touch", "footprint_confidence",
 ]
 
 METRIC_FIELDS = [
@@ -41,9 +60,15 @@ SUMMARY_FIELDS = [
 SKIPPED_FIELDS = ["experiment", "sample", "px_um", "size_z", "skipped", "skip_reason"]
 
 
+def _border_cells(labels: np.ndarray) -> set[int]:
+    """Cell ids whose BODY reaches the frame edge (true border_touch)."""
+    edge = set(labels[0, :]) | set(labels[-1, :]) | set(labels[:, 0]) | set(labels[:, -1])
+    return {int(c) for c in edge if c > 0}
+
+
 def _cell_metrics(
     cfg, group, replicate, filestem, px_um,
-    nucleus_mip, mito_mask, nucleus_labels, territories,
+    nucleus_mip, mito_mask, nucleus_labels, territories, footprint,
 ) -> list[dict]:
     """One metrics row per territory (focus flag applied later, per-image)."""
     rows = []
@@ -53,6 +78,7 @@ def _cell_metrics(
     )
     px_area_um2 = px_um**2
     h, w = territories.shape
+    border_ids = _border_cells(territories)
 
     for cell_id in range(1, int(nucleus_labels.max()) + 1):
         territory = territories == cell_id
@@ -83,10 +109,17 @@ def _cell_metrics(
             else 0.0
         )
         min_edge_distance = min(y0, x0, h - y1, w - x1)
+        terr_px = int(terr_c.sum())
+        if footprint is not None:
+            fp_cover = int((footprint[y0:y1, x0:x1] & terr_c).sum())
+            footprint_confidence = fp_cover / terr_px if terr_px else 0.0
+        else:
+            footprint_confidence = float("nan")
 
         rows.append({
             "experiment": cfg.experiment, "group": group, "replicate": replicate,
             "sample": filestem, "px_um": px_um, "cell_id": cell_id,
+            "nucleus_id": cell_id,
             "nucleus_area_um2": float(nuc_c.sum()) * px_area_um2,
             "territory_area_um2": territory_area_um2,
             "mito_area_um2": mito_area_um2,
@@ -99,7 +132,8 @@ def _cell_metrics(
             "mito_border_frac": mito_border_frac,
             "focus_score": score,
             "edge_distance_px": min_edge_distance,
-            "border_touch": min_edge_distance == 0,
+            "footprint_confidence": footprint_confidence,
+            "border_touch": cell_id in border_ids,
             "empty": mito_area_um2 < cfg.mito_min_um2,
         })
     return rows
@@ -135,6 +169,18 @@ def _image_summary(cfg, group, replicate, filestem, px_um, li_threshold, focus_t
         obj = [float(r[field]) for r in objective_rows]
         summary[f"objective_median_{field}"] = float(np.median(obj)) if obj else np.nan
     return summary
+
+
+def _qc_row(r: dict) -> dict:
+    """Project a metrics row onto the Module A->B QC contract (QC_FIELDS)."""
+    return {
+        "experiment": r["experiment"], "group": r["group"],
+        "replicate": r["replicate"], "sample": r["sample"],
+        "cell_id": r["cell_id"], "nucleus_id": r["nucleus_id"],
+        "area_um2": r["territory_area_um2"],
+        "border_touch": r["border_touch"],
+        "footprint_confidence": r["footprint_confidence"],
+    }
 
 
 def _write_skipped(cfg, filestem, manifest_row, reason):
@@ -175,7 +221,16 @@ def compute_one(cfg: ExperimentConfig, filestem: str, manifest_rows: dict) -> No
     mito_mask, li_threshold = pipeline_li(mito_mip, px_um)
     mito_mask = mito_mask.astype(bool)
     nucleus_labels, _ = segment_nuclei(nucleus_mip, cfg, px_um)
-    territories = build_territories(nucleus_labels, cfg, px_um)
+
+    # Prefer the footprint-bounded, nucleus-seeded watershed (Module A). Fall back
+    # to the legacy Voronoi only if Cellpose is unavailable in this env.
+    try:
+        footprint = cell_footprint(mito_mip, nucleus_mip, cfg, px_um)
+        territories = resolve_instances(nucleus_labels, footprint, mito_mask, cfg, px_um)
+    except ImportError:
+        print(f"WARNING: cellpose unavailable; legacy Voronoi territories for {filestem}")
+        footprint = None
+        territories = build_territories(nucleus_labels, cfg, px_um)
 
     sample_dir = cfg.results / "04_cellqc" / group / filestem
     (sample_dir / "masks").mkdir(parents=True, exist_ok=True)
@@ -184,7 +239,7 @@ def compute_one(cfg: ExperimentConfig, filestem: str, manifest_rows: dict) -> No
 
     rows = _cell_metrics(
         cfg, group, replicate, filestem, px_um,
-        nucleus_mip, mito_mask, nucleus_labels, territories,
+        nucleus_mip, mito_mask, nucleus_labels, territories, footprint,
     )
     focus_threshold = _apply_focus_flag(rows, cfg)
     summary = _image_summary(
@@ -193,6 +248,7 @@ def compute_one(cfg: ExperimentConfig, filestem: str, manifest_rows: dict) -> No
 
     table_dir = sample_dir / "tables"
     write_csv(table_dir / f"{filestem}_cells.csv", rows, CELL_FIELDS)
+    write_csv(table_dir / f"{filestem}_cellqc.csv", [_qc_row(r) for r in rows], QC_FIELDS)
     write_csv(table_dir / f"{filestem}_image_summary.csv", [summary], SUMMARY_FIELDS)
     print(f"cellqc {cfg.experiment}/{filestem}: {len(rows)} cells, "
           f"{summary['n_qc_pass']} qc_pass", flush=True)
