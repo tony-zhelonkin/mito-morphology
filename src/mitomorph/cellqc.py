@@ -23,7 +23,7 @@ from .io import read_manifest, resolve_samples, to_uint8, write_csv
 from .metrics import compute_skeleton_metrics, focus_score, mito_shape_metrics
 from .segment import (
     build_territories,
-    cell_footprint,
+    cell_bodies,
     pipeline_li,
     resolve_instances,
     segment_nuclei,
@@ -222,11 +222,13 @@ def compute_one(cfg: ExperimentConfig, filestem: str, manifest_rows: dict) -> No
     mito_mask = mito_mask.astype(bool)
     nucleus_labels, _ = segment_nuclei(nucleus_mip, cfg, px_um)
 
-    # Prefer the footprint-bounded, nucleus-seeded watershed (Module A). Fall back
-    # to the legacy Voronoi only if Cellpose is unavailable in this env.
+    # Module A: trust Cellpose instance bodies, reconcile with nucleus seeds
+    # (1-nucleus bodies kept intact; multi-nucleus bodies split). Fall back to the
+    # legacy Voronoi only if Cellpose is unavailable in this env.
     try:
-        footprint = cell_footprint(mito_mip, nucleus_mip, cfg, px_um)
-        territories = resolve_instances(nucleus_labels, footprint, mito_mask, cfg, px_um)
+        bodies = cell_bodies(mito_mip, nucleus_mip, cfg, px_um)
+        territories = resolve_instances(nucleus_labels, bodies, mito_mask, cfg, px_um)
+        footprint = bodies > 0  # for footprint_confidence (fraction body-backed)
     except ImportError:
         print(f"WARNING: cellpose unavailable; legacy Voronoi territories for {filestem}")
         footprint = None
