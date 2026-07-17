@@ -81,3 +81,30 @@ def focus_score(nucleus_mip: np.ndarray, laplace: np.ndarray, territory: np.ndar
     lap_vals = laplace[territory]
     nuc_vals = nucleus_mip[territory].astype(float)
     return float(np.var(lap_vals) / (float(nuc_vals.mean()) ** 2 + FOCUS_EPS))
+
+
+def mito_object_props(mask: np.ndarray, px_um: float) -> list[dict]:
+    """One shape-metrics dict per connected mitochondrial object in a binary mask."""
+    px_area_um2 = px_um**2
+    labels = measure.label(mask, background=0)
+    rows = []
+    for prop in measure.regionprops(labels):
+        perimeter_um = prop.perimeter * px_um
+        area_um2 = prop.area * px_area_um2
+        form_factor = (
+            4.0 * math.pi * prop.area / (prop.perimeter**2) if prop.perimeter > 0 else 0.0
+        )
+        centroid_y, centroid_x = prop.centroid
+        rows.append({
+            "object_id": int(prop.label),
+            "area_um2": round(area_um2, 3),
+            "perimeter_um": round(perimeter_um, 3),
+            "solidity": round(float(prop.solidity), 3),
+            "eccentricity": round(float(prop.eccentricity), 3),
+            "major_axis_um": round(prop.axis_major_length * px_um, 3),
+            "minor_axis_um": round(prop.axis_minor_length * px_um, 3),
+            "form_factor": round(form_factor, 3),
+            "centroid_y": round(float(centroid_y), 3),
+            "centroid_x": round(float(centroid_x), 3),
+        })
+    return rows
