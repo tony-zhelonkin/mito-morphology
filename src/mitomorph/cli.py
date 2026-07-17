@@ -2,6 +2,7 @@
 
 Runs against the experiment.toml in the current directory (or --root):
   mito inventory
+  mito to-zarr   [--samples ...]
   mito extract   [--samples ...]
   mito cellqc    [--samples ...]
   mito cellqc-viz [--samples ...]
@@ -11,7 +12,7 @@ from __future__ import annotations
 
 import argparse
 
-from . import cellqc, extract, inventory, viz
+from . import cellqc, extract, inventory, omezarr, viz
 from .config import load_config
 
 
@@ -19,7 +20,7 @@ def main() -> None:
     p = argparse.ArgumentParser(prog="mito", description="Mitochondrial morphology pipeline.")
     p.add_argument("--root", default=".", help="Experiment repo root (has experiment.toml).")
     sub = p.add_subparsers(dest="command", required=True)
-    for name in ("inventory", "extract", "cellqc", "cellqc-viz", "all"):
+    for name in ("inventory", "to-zarr", "extract", "cellqc", "cellqc-viz", "all"):
         sp = sub.add_parser(name)
         if name != "inventory":
             sp.add_argument("--samples", nargs="*", help="Optional filestems to process.")
@@ -30,6 +31,8 @@ def main() -> None:
 
     if args.command == "inventory":
         inventory.run(cfg)
+    elif args.command == "to-zarr":
+        omezarr.run(cfg, samples)
     elif args.command == "extract":
         extract.run(cfg, samples)
     elif args.command == "cellqc":

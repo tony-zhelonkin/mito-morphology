@@ -31,6 +31,9 @@ class ExperimentConfig:
     # a cell is out_of_focus if its focus_score < focus_rel_factor * image median.
     focus_rel_factor: float = 0.33
 
+    # OME-Zarr substrate (NGFF); Zarr v2 for broadest tool support.
+    ngff_version: str = "0.4"
+
     @property
     def raw(self) -> Path:
         return self.root / "00_data" / "raw" / self.experiment
@@ -58,6 +61,7 @@ def load_config(root: Path | str = ".") -> ExperimentConfig:
     with path.open("rb") as fh:
         data = tomllib.load(fh)
     qc = data.get("qc", {})
+    ome = data.get("ome_zarr", {})
     return ExperimentConfig(
         root=root,
         experiment=data["experiment"],
@@ -70,4 +74,5 @@ def load_config(root: Path | str = ".") -> ExperimentConfig:
         max_cell_radius_um=float(qc.get("max_cell_radius_um", 12.0)),
         mito_min_um2=float(qc.get("mito_min_um2", 1.0)),
         focus_rel_factor=float(qc.get("focus_rel_factor", 0.33)),
+        ngff_version=str(ome.get("ngff_version", "0.4")),
     )
