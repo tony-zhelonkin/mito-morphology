@@ -10,8 +10,9 @@ Runs against the experiment.toml in the current directory (or --root):
   mito cellseg-viz  [--samples ...]
   mito quantify     [--samples ...]
   mito quantify-viz [--samples ...]
+  mito integrate    [--samples ...]
   mito all          [--samples ...]   # inventory -> extract -> mitoseg -> cellseg
-                                       # -> quantify -> *-viz
+                                       # -> quantify -> integrate -> *-viz
 """
 from __future__ import annotations
 
@@ -21,6 +22,7 @@ from . import (
     cellseg,
     cellseg_viz,
     extract,
+    integrate,
     inventory,
     mitoseg,
     mitoseg_viz,
@@ -46,6 +48,7 @@ def main() -> None:
         "cellseg-viz",
         "quantify",
         "quantify-viz",
+        "integrate",
         "all",
     ):
         sp = sub.add_parser(name)
@@ -58,7 +61,7 @@ def main() -> None:
     # Stamp provenance for every run that produces analysis outputs (skip pure
     # inventory / zarr-conversion and viz-only stages, which record their own
     # state or none).
-    if args.command in ("mitoseg", "cellseg", "quantify", "all"):
+    if args.command in ("mitoseg", "cellseg", "quantify", "integrate", "all"):
         write_run_manifest(cfg, f"mito {args.command}", samples)
 
     if args.command == "inventory":
@@ -79,12 +82,15 @@ def main() -> None:
         quantify.run(cfg, samples)
     elif args.command == "quantify-viz":
         quantify_viz.run(cfg, samples)
+    elif args.command == "integrate":
+        integrate.run(cfg, samples)
     elif args.command == "all":
         inventory.run(cfg)
         extract.run(cfg, samples)
         mitoseg.run(cfg, samples)
         cellseg.run(cfg, samples)
         quantify.run(cfg, samples)
+        integrate.run(cfg, samples)
         mitoseg_viz.run(cfg, samples)
         cellseg_viz.run(cfg, samples)
         quantify_viz.run(cfg, samples)
