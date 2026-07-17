@@ -22,7 +22,7 @@ import numpy as np
 import pandas as pd
 
 from .config import ExperimentConfig
-from .provenance import _git_state, _mitomorph_version
+from .provenance import _mitomorph_version, git_provenance
 
 MASTER_DIR = "master"
 KNOWN_EXPERIMENTS = ("20260518_TBK1i", "20251029_glutamine")
@@ -127,7 +127,7 @@ def _write_manifest(
     """Provenance for the master tables: mitomorph version/sha, source stage, sources."""
     import yaml
 
-    sha, dirty = _git_state()
+    prov = git_provenance()
     manifest = {
         "experiment": cfg.experiment,
         "config_version": cfg.config_version,
@@ -136,8 +136,9 @@ def _write_manifest(
         "n_cells": n_cells,
         "mitomorph": {
             "version": _mitomorph_version(),
-            "git_sha": sha,
-            "git_dirty": dirty,
+            "git_sha": prov["git_sha"],
+            "git_dirty": prov["git_dirty"],
+            "git_source": prov["source"],
         },
         "source_files": {
             "cells": [str(p.relative_to(cfg.root)) for p in cells_paths],
