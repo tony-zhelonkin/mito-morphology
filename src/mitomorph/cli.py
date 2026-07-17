@@ -14,6 +14,7 @@ import argparse
 
 from . import cellqc, extract, inventory, omezarr, viz
 from .config import load_config
+from .provenance import write_run_manifest
 
 
 def main() -> None:
@@ -28,6 +29,10 @@ def main() -> None:
     args = p.parse_args()
     cfg = load_config(args.root)
     samples = getattr(args, "samples", None)
+    # Stamp provenance for every run that produces analysis outputs (skip pure
+    # inventory / zarr-conversion, which record their own state).
+    if args.command in ("cellqc", "all"):
+        write_run_manifest(cfg, f"mito {args.command}", samples)
 
     if args.command == "inventory":
         inventory.run(cfg)

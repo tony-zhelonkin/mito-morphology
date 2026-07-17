@@ -18,6 +18,7 @@ dependencies = [
     "bioio",
     "bioio-czi",
     "matplotlib",
+    "pyyaml",
 ]
 
 [project.scripts]

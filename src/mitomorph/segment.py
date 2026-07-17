@@ -12,23 +12,15 @@ from skimage import feature, filters, measure, morphology, segmentation
 from .config import ExperimentConfig
 from .io import area_px, radius_px, to_uint8
 
-# remove_small_objects/holes: skimage 0.26 replaced min_size/area_threshold with
-# max_size. Verified empirically that max_size=N reproduces the old min_size=N
-# exactly, preserving the frozen MVP behaviour (min 32 px). Kept fixed by decision.
-_MIN_OBJECT_PX = 32
+# Fallback noise floor for the provenance-only `threshold_masks` tool. The run
+# path (`pipeline_li`) instead uses a PHYSICAL floor (cfg.mito_min_object_um2)
+# scaled by px_um, so the smallest retained object is the same physical size
+# across batches with different pixel sizes.
+_MIN_OBJECT_PX_FALLBACK = 32
 
-# --- Cellpose whole-cell footprint (Module A) ---------------------------------
-# cellprob < 0 grows masks into dimmer edge mito (fixes under-coverage of big
-# cells); flow > default keeps lower-quality masks. MITO_GAMMA < 1 brightens dim
-# peripheral mito so Cellpose recalls faint edges / low-signal cells.
-CELLPROB_THRESHOLD = -2.0
-FLOW_THRESHOLD = 0.7
-MITO_GAMMA = 0.5
-
-# LAMBDA (in EDT-pixel units): cost of crossing one non-mito pixel relative to one
-# pixel of Euclidean distance. High enough that any mito path beats a dark-gap
-# crossing, so watershed ridges fall in the mito-empty gaps *between* cells.
-_ELEVATION_LAMBDA = 50.0
+# Cellpose (cell_bodies), watershed (resolve_instances), and the mito noise floor
+# are now config-driven knobs on ExperimentConfig (run-config.yaml), not module
+# constants — so a run's parameters are tracked and reproducible.
 
 
 def preprocess_li(mip: np.ndarray, px_um: float) -> np.ndarray:
@@ -37,17 +29,26 @@ def preprocess_li(mip: np.ndarray, px_um: float) -> np.ndarray:
     return morphology.white_tophat(to_uint8(img), morphology.disk(radius_px(1.5, px_um)))
 
 
-def postprocess_li(mask: np.ndarray) -> np.ndarray:
-    """Match the MVP Li baseline postprocessing."""
-    mask = morphology.remove_small_objects(mask.astype(bool), max_size=_MIN_OBJECT_PX)
-    return morphology.remove_small_holes(mask, max_size=_MIN_OBJECT_PX)
+def postprocess_li(mask: np.ndarray, min_object_px: int = _MIN_OBJECT_PX_FALLBACK) -> np.ndarray:
+    """Match the MVP Li baseline postprocessing (min-object floor in pixels)."""
+    mask = morphology.remove_small_objects(mask.astype(bool), max_size=min_object_px)
+    return morphology.remove_small_holes(mask, max_size=min_object_px)
 
 
-def pipeline_li(mip: np.ndarray, px_um: float) -> tuple[np.ndarray, float]:
-    """Locked Li mitochondrial mask; returns (mask, li_threshold)."""
+def pipeline_li(
+    mip: np.ndarray, px_um: float, cfg: ExperimentConfig | None = None
+) -> tuple[np.ndarray, float]:
+    """Locked Li mitochondrial mask; returns (mask, li_threshold).
+
+    The noise floor is physical (cfg.mito_min_object_um2 -> px via px_um); falls
+    back to the frozen 32 px when no cfg is supplied (e.g. provenance tooling)."""
     pre = preprocess_li(mip, px_um)
     threshold = float(filters.threshold_li(pre))
-    return postprocess_li(pre > threshold), threshold
+    min_px = (
+        area_px(cfg.mito_min_object_um2, px_um) if cfg is not None
+        else _MIN_OBJECT_PX_FALLBACK
+    )
+    return postprocess_li(pre > threshold, min_px), threshold
 
 
 def threshold_masks(mip: np.ndarray) -> dict[str, tuple[np.ndarray, float]]:
@@ -119,10 +120,10 @@ def build_territories(
     return territories.astype(np.int32)
 
 
-def _enhance_mito(mito_mip: np.ndarray) -> np.ndarray:
+def _enhance_mito(mito_mip: np.ndarray, gamma: float) -> np.ndarray:
     """Gamma-brighten dim mito so Cellpose recalls faint peripheries / cells."""
     x = to_uint8(mito_mip).astype(np.float32) / 255.0
-    return (np.power(x, MITO_GAMMA) * 255.0).astype(np.float32)
+    return (np.power(x, gamma) * 255.0).astype(np.float32)
 
 
 def cell_bodies(
@@ -143,12 +144,12 @@ def cell_bodies(
 
     diameter = 2.0 * radius_px(cfg.max_cell_radius_um, px_um)  # cell ~ 2x radius cap
     rgb = np.zeros((*mito_mip.shape, 3), dtype=np.float32)
-    rgb[..., 0] = _enhance_mito(mito_mip)
+    rgb[..., 0] = _enhance_mito(mito_mip, cfg.mito_gamma)
     rgb[..., 1] = to_uint8(nucleus_mip)
-    model = models.Cellpose(gpu=gpu, model_type="cyto3")
+    model = models.Cellpose(gpu=gpu, model_type=cfg.cellpose_model_type)
     masks, _, _, _ = model.eval(
         rgb, diameter=diameter, channels=[1, 2],
-        cellprob_threshold=CELLPROB_THRESHOLD, flow_threshold=FLOW_THRESHOLD,
+        cellprob_threshold=cfg.cellprob_threshold, flow_threshold=cfg.flow_threshold,
     )
     return masks.astype(np.int32)
 
@@ -182,7 +183,7 @@ def resolve_instances(
 
     # Shared geodesic elevation, reused for any multi-nucleus body split.
     elevation = ndimage.distance_transform_edt(~nucleus_mask).astype(np.float32)
-    elevation += _ELEVATION_LAMBDA * (~mito_mask & ~nucleus_mask).astype(np.float32)
+    elevation += cfg.elevation_lambda * (~mito_mask & ~nucleus_mask).astype(np.float32)
 
     for body_id in range(1, int(cp_bodies.max()) + 1):
         body = cp_bodies == body_id

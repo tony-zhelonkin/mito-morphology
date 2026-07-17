@@ -218,7 +218,7 @@ def compute_one(cfg: ExperimentConfig, filestem: str, manifest_rows: dict) -> No
 
     mito_mip = tifffile.imread(mip_path)
     nucleus_mip = to_uint8(channel_mip(czi, cfg.nucleus_channel_index)[0])
-    mito_mask, li_threshold = pipeline_li(mito_mip, px_um)
+    mito_mask, li_threshold = pipeline_li(mito_mip, px_um, cfg)
     mito_mask = mito_mask.astype(bool)
     nucleus_labels, _ = segment_nuclei(nucleus_mip, cfg, px_um)
 
