@@ -40,6 +40,22 @@ _N_SCALES = 4
 _DOWNSCALE = 2
 
 
+def _pyramid_scale_transforms(px_um: float, n_axes: int) -> list[list[dict]]:
+    """Per-pyramid-level ``coordinateTransformations`` for a physical XY pixel size.
+
+    Shared by the image writer (4 axes: c,z,y,x) and the label writer (2 axes:
+    y,x) so an image pyramid and its label pyramids describe the SAME physical
+    scale at each level; ``n_axes`` picks how many leading non-XY axes get the
+    identity scale ``1.0``.
+    """
+    lead = [1.0] * (n_axes - 2)
+    return [
+        [{"type": "scale",
+          "scale": lead + [px_um * (_DOWNSCALE**lvl), px_um * (_DOWNSCALE**lvl)]}]
+        for lvl in range(_N_SCALES)
+    ]
+
+
 def czi_to_zarr(
     czi_path: Path | str,
     out_zarr_path: Path | str,
@@ -85,11 +101,7 @@ def czi_to_zarr(
         {"name": "x", "type": "space", "unit": "micrometer"},
     ]
     # One scale transform per pyramid level; XY scale grows with the 2x downsample.
-    coordinate_transformations = [
-        [{"type": "scale",
-          "scale": [1.0, 1.0, px_um * (_DOWNSCALE**lvl), px_um * (_DOWNSCALE**lvl)]}]
-        for lvl in range(_N_SCALES)
-    ]
+    coordinate_transformations = _pyramid_scale_transforms(px_um, len(axes))
 
     import zarr
 
@@ -164,6 +176,195 @@ def list_label_versions(zarr_path: Path | str) -> list[str]:
     if not labels_dir.is_dir():
         return []
     return sorted(p.name for p in labels_dir.iterdir() if p.is_dir())
+
+
+# Fixed, IDEMPOTENT label-group names for the .npy -> NGFF migration (`migrate-labels`):
+# each is overwritten in place on re-run, unlike `write_labels`'s immutable
+# `labels/<version>/` ladder for the segmentation A->B seam. Maps name -> the
+# `.npy` path relative to an experiment's 03_results tree.
+_MASK_SOURCES = {
+    "mito": lambda cfg, group, stem: cfg.results / "03_mitoseg" / group / stem / "masks" / "mito.npy",
+    "nuclei": lambda cfg, group, stem: cfg.results / "04_cellseg" / group / stem / "masks" / "nuclei.npy",
+    "territories":
+        lambda cfg, group, stem: cfg.results / "04_cellseg" / group / stem / "masks" / "territories.npy",
+}
+
+
+def write_named_labels(
+    zarr_path: Path | str,
+    label_array: np.ndarray,
+    name: str,
+    px_um: float,
+    provenance: dict,
+) -> str:
+    """Write/overwrite one FIXED-name label group (``labels/<name>/``), idempotently.
+
+    Unlike ``write_labels`` (immutable ``labels/<version>/`` ladder for the
+    segmentation seam), this is the durable NGFF copy of an already-final
+    compute-native mask (mito/nuclei/territories/expert_final): re-running
+    ``migrate-labels`` must refresh a label group in place — without growing
+    an unbounded version list or touching the image pyramid under ``0/``.
+    Reuses the image writer's pixel-size scaling (`_pyramid_scale_transforms`)
+    so the label pyramid lines up with the image at every level.
+    """
+    import shutil
+
+    import zarr
+    from ome_zarr.io import parse_url
+    from ome_zarr.scale import Scaler
+    from ome_zarr.writer import write_labels as _write_labels
+
+    zarr_path = Path(zarr_path)
+    label_dir = zarr_path / "labels" / name
+    if label_dir.exists():
+        shutil.rmtree(label_dir)
+
+    label_array = np.asarray(label_array)
+    store = parse_url(str(zarr_path), mode="a").store
+    root = zarr.group(store=store)
+    _write_labels(
+        label_array,
+        group=root,
+        name=name,
+        axes=_label_axes(label_array.ndim),
+        coordinate_transformations=_pyramid_scale_transforms(px_um, label_array.ndim),
+        scaler=Scaler(downscale=_DOWNSCALE, max_layer=_N_SCALES - 1, method="nearest"),
+    )
+    root["labels"][name].attrs["mitomorph_provenance"] = dict(provenance)
+    # ome_zarr's write_labels appends `name` to the top-level labels/.zattrs
+    # list without deduping; since this writer is idempotent (re-run after
+    # `shutil.rmtree` above), collapse to a stable, order-preserving, unique list.
+    labels_group = root["labels"]
+    seen: list[str] = []
+    for n in labels_group.attrs.get("labels", []):
+        if n not in seen:
+            seen.append(n)
+    labels_group.attrs["labels"] = seen
+    return name
+
+
+def _pick_expert_annotation(annotations_dir: Path) -> Path | None:
+    """Pick the most-final hand annotation among ``annotations/*.npy``.
+
+    Files are grouped by base name with an optional ``_v<N>`` revision suffix
+    (``hard_cases.npy`` -> v1, ``hard_cases_v2.npy`` -> v2). The largest such
+    series (by file count) is treated as the deliberate expert-curation
+    track, and its highest revision wins — even over a differently-named,
+    more-recently-modified one-off file (e.g. ``single_case.npy``), which is
+    a separate, narrower annotation rather than a further revision of the
+    main series. Returns ``None`` if the directory has no ``.npy`` files.
+    """
+    import re
+
+    files = sorted(annotations_dir.glob("*.npy"))
+    if not files:
+        return None
+    series: dict[str, list[tuple[int, Path]]] = {}
+    for f in files:
+        m = re.match(r"^(.*)_v(\d+)$", f.stem)
+        base, ver = (m.group(1), int(m.group(2))) if m else (f.stem, 1)
+        series.setdefault(base, []).append((ver, f))
+    _base, versions = max(series.items(), key=lambda kv: (len(kv[1]), kv[0]))
+    return max(versions, key=lambda vf: vf[0])[1]
+
+
+def migrate_labels_for_sample(
+    cfg: ExperimentConfig, filestem: str, manifest_rows: dict,
+) -> list[str]:
+    """Write the fixed-name ``labels/`` groups for one sample from its ``.npy``
+    masks: mito/nuclei/territories, plus ``expert_final`` if a hand annotation
+    exists under ``04_cellseg/<group>/<stem>/annotations/``.
+
+    If the sample has no NGFF store yet, one is created first from the raw CZI
+    (same convert-on-demand behavior as ``to-zarr``) since ``labels/`` hangs
+    off an existing image pyramid. The ``mito`` source mask is boolean and is
+    relabeled into per-object instance ids (matching the ``n_objects``
+    convention used elsewhere in the pipeline) before being written.
+    ``nuclei``/``territories`` are already instance-labeled and written as-is.
+
+    ``expert_final`` fidelity is preserved from the annotation's actual content
+    (this is the least-recoverable layer): a boolean / effectively-binary paint
+    annotation (only {0,1}) is relabeled into connected components, but an
+    annotation that already carries distinct instance ids (multiple nonzero
+    values) is written AS-IS — relabeling it would silently merge touching
+    curated objects. The path taken is recorded in the label's provenance attrs
+    under ``expert_final_mode`` ("relabeled" | "as_is").
+    """
+    from skimage import measure
+
+    from .provenance import _git_state, _mitomorph_version
+
+    manifest_row = manifest_rows[(cfg.experiment, f"{filestem}.czi")]
+    px_um = float(manifest_row["px_x_um"])
+    group, _replicate = cfg.parse_sample(filestem)
+
+    zarr_path = cfg.results / "00_ome_zarr" / group / f"{filestem}.zarr"
+    if not zarr_path.exists():
+        czi = cfg.raw / f"{filestem}.czi"
+        if not czi.exists():
+            print(f"ERROR: missing raw CZI: {czi}; cannot create NGFF store for {filestem}")
+            return []
+        print(f"no NGFF store yet for {cfg.experiment}/{filestem}; "
+              f"converting {czi} -> {zarr_path} ...", flush=True)
+        czi_to_zarr(czi, zarr_path, px_um)
+
+    sha, dirty = _git_state()
+
+    def _provenance(npy_path: Path) -> dict:
+        return {
+            "version": _mitomorph_version(),
+            "git_sha": sha,
+            "git_dirty": dirty,
+            "config_version": cfg.config_version,
+            "source_npy": str(npy_path.relative_to(cfg.root)),
+        }
+
+    written = []
+    for name, path_fn in _MASK_SOURCES.items():
+        npy_path = path_fn(cfg, group, filestem)
+        if not npy_path.exists():
+            print(f"WARNING: no {name} mask for {cfg.experiment}/{filestem} ({npy_path}); skipping")
+            continue
+        arr = np.load(npy_path)
+        if name == "mito":
+            arr = measure.label(arr.astype(bool), background=0)
+        write_named_labels(zarr_path, arr.astype(np.int32), name, px_um, _provenance(npy_path))
+        written.append(name)
+
+    annotations_dir = cfg.results / "04_cellseg" / group / filestem / "annotations"
+    if annotations_dir.is_dir():
+        chosen = _pick_expert_annotation(annotations_dir)
+        if chosen is not None:
+            raw = np.load(chosen)
+            # Binary paint (bool, or integer with only {0,1}) -> connected
+            # components; an already-instance-labelled annotation (distinct
+            # nonzero ids) is preserved as-is to avoid merging curated objects.
+            is_binary = raw.dtype == bool or int(np.asarray(raw).max(initial=0)) <= 1
+            if is_binary:
+                arr = measure.label(raw.astype(bool), background=0)
+                mode = "relabeled"
+            else:
+                arr = raw
+                mode = "as_is"
+            prov = {**_provenance(chosen), "expert_final_mode": mode}
+            write_named_labels(zarr_path, arr.astype(np.int32), "expert_final", px_um, prov)
+            written.append("expert_final")
+
+    print(f"migrate-labels {cfg.experiment}/{filestem}: wrote labels/{{{', '.join(written)}}}", flush=True)
+    return written
+
+
+def run_migrate_labels(cfg: ExperimentConfig, samples: list[str] | None) -> None:
+    """Batch ``migrate-labels``: ``.npy`` masks -> NGFF ``labels/`` groups, per sample."""
+    manifest_rows = read_manifest(cfg)
+    for filestem, _czi in resolve_samples(cfg, samples):
+        if filestem in cfg.skip_samples:
+            print(f"WARNING: skipping {cfg.experiment}/{filestem} (config skip_samples)")
+            continue
+        try:
+            migrate_labels_for_sample(cfg, filestem, manifest_rows)
+        except (KeyError, ValueError) as exc:
+            print(f"ERROR: {cfg.experiment}/{filestem}: {exc}")
 
 
 def run(cfg: ExperimentConfig, samples: list[str] | None) -> None:

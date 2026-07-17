@@ -3,6 +3,7 @@
 Runs against the experiment.toml in the current directory (or --root):
   mito inventory
   mito to-zarr      [--samples ...]
+  mito migrate-labels [--samples ...]  # .npy masks -> NGFF labels/ groups (opt-in)
   mito extract      [--samples ...]
   mito mitoseg      [--samples ...]
   mito mitoseg-viz  [--samples ...]
@@ -41,6 +42,7 @@ def main() -> None:
     for name in (
         "inventory",
         "to-zarr",
+        "migrate-labels",
         "extract",
         "mitoseg",
         "mitoseg-viz",
@@ -61,13 +63,15 @@ def main() -> None:
     # Stamp provenance for every run that produces analysis outputs (skip pure
     # inventory / zarr-conversion and viz-only stages, which record their own
     # state or none).
-    if args.command in ("mitoseg", "cellseg", "quantify", "integrate", "all"):
+    if args.command in ("mitoseg", "cellseg", "quantify", "integrate", "all", "migrate-labels"):
         write_run_manifest(cfg, f"mito {args.command}", samples)
 
     if args.command == "inventory":
         inventory.run(cfg)
     elif args.command == "to-zarr":
         omezarr.run(cfg, samples)
+    elif args.command == "migrate-labels":
+        omezarr.run_migrate_labels(cfg, samples)
     elif args.command == "extract":
         extract.run(cfg, samples)
     elif args.command == "mitoseg":
